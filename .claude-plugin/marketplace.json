@@ -15,7 +15,8 @@
       "author": {
         "name": "devnoyo0123"
       },
-      "homepage": "https://devnoyo0123.github.io/loop-guide/"
+      "homepage": "https://devnoyo0123.github.io/loop-guide/",
+      "license": "MIT"
     }
   ]
 }

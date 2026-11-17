@@ -6,6 +6,7 @@
     "name": "devnoyo0123"
   },
   "homepage": "https://devnoyo0123.github.io/loop-guide/",
+  "license": "MIT",
   "mcpServers": {
     "loop": {
       "type": "stdio",
