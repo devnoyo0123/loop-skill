@@ -1,0 +1,9 @@
+{
+  "name": "loop",
+  "description": "Connect Claude to the Loop journal app's local MCP server: search your journal logs, build morning notes and reviews, troubleshoot the connection.",
+  "version": "1.0.0",
+  "author": {
+    "name": "devnoyo0123"
+  },
+  "homepage": "https://devnoyo0123.github.io/loop-guide/"
+}
