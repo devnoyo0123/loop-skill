@@ -21,11 +21,17 @@ Once the server named `loop` is registered, its tools appear as `mcp__loop__*`:
 
 1. **Check for an existing registration**: run `claude mcp list`. If a server named `loop` shows as connected, skip to step 4.
 2. **Ask the user to start the server on the phone**: Loop → Settings → MCP server → toggle on, on the same Wi-Fi as this machine (a phone hotspot works too — connect this machine to it). The app screen shows the exact connection command.
-3. **Register** using the values the user copies from the app screen — never invent an IP or token:
+3. **Register** — never invent an IP or token. Two ways to get the values:
+   the user pastes the copied command from the app screen, or reads the URL
+   and token aloud from it (tap the eye icon to reveal the 43-character
+   token). Assemble from those values:
    ```bash
    claude mcp remove loop -s user 2>/dev/null; claude mcp add --transport http -s user loop http://<phone-ip>:8765/mcp --header "Authorization: Bearer <token>"
    ```
-4. **Verify**: `claude mcp list` shows `loop` as connected, then probe with `logs_on_day` for today. If it returns without error, the connection works.
+4. **Verify**: `claude mcp list` shows `loop` as connected. A registration made
+   during this session does not load into it — if the `mcp__loop__*` tools are
+   missing, tell the user to restart Claude Code (or run `/mcp`) and continue
+   in the next session. Once loaded, probe with `logs_on_day` for today.
 5. **Collect**: run the searches the request needs. Widen with `from`/`to` windows, then pull `get_chain` on the ids that look most relevant so replies keep their context.
 6. **Organize**: deliver what was asked for — a note, a review, an answer — **in the user's language**. Quote sparingly; these are private logs.
 
