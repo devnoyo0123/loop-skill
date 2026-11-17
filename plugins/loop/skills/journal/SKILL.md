@@ -38,10 +38,12 @@ Tools appear as `mcp__loop__*` automatically once the plugin is installed. No
 
 1. **Try the request directly.** If the phone is linked, search tools just
    work — skip to Collect below.
-2. **If not connected**, call `bridge_status`, then guide the user:
-   phone → Loop → Settings → **PC 연결** → connect to this Mac (auto-discovered,
-   or enter the Mac's IP — get it with `ipconfig getifaddr en0`; the bridge
-   listens on port 8766). The phone app must stay in the foreground.
+2. **If not connected**, call `bridge_status` — it includes this Mac's LAN
+   address for the phone. If it doesn't, get the address yourself with
+   `ipconfig getifaddr en0`. **Never ask the user to find their IP.** Tell
+   them exactly what to type, e.g.:
+   `폰에서 Loop → 설정 → PC 연결 을 열고 이 주소를 입력하세요: 192.168.35.8`
+   and remind them to keep the app in the foreground while using it.
 3. **If the phone asks for a code** (first pairing), call `pairing_code` and
    show the 8 digits prominently, e.g. `폰에 입력: 5832 9417`. Pairing is
    once; afterwards the phone reconnects automatically.
