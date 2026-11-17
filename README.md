@@ -52,10 +52,10 @@ plugins/loop/                     ← the plugin
 └── skills/journal/SKILL.md       ← the skill
 ```
 
-## Repository
+## Links
 
-Loop app: [devnoyo0123/loop](https://github.com/devnoyo0123/loop) ·
-Design docs: `docs/adr-001-local-mcp-server.md`, `docs/mcp-design.md`
+Loop app guide: [devnoyo0123.github.io/loop-guide](https://devnoyo0123.github.io/loop-guide/) ·
+The app itself is closed-source; this repo holds only the Claude Code skill.
 
 ## 한국어
 
