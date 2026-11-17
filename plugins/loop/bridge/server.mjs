@@ -11,6 +11,16 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 
+/** First LAN IPv4 of this Mac — shown in bridge_status for manual phone entry. */
+function lanIp() {
+  for (const ifaces of Object.values(os.networkInterfaces())) {
+    for (const i of ifaces ?? []) {
+      if (i.family === 'IPv4' && !i.internal) return i.address;
+    }
+  }
+  return null;
+}
+
 const TCP_PORT = Number(process.env.LOOP_BRIDGE_PORT || 8766);
 const STATE_FILE =
   process.env.LOOP_BRIDGE_STATE ||
@@ -359,6 +369,8 @@ function rpcError(id, code, message) {
 function bridgeStatusText() {
   const lines = [];
   if (tcpBusy) lines.push(`Another Claude session owns the phone link (port ${TCP_PORT} in use).`);
+  const ip = lanIp();
+  if (ip) lines.push(`This Mac's address for the phone: ${ip} (port ${TCP_PORT}).`);
   if (phone) {
     lines.push(`Phone connected (device ${phone.deviceId}).`);
   } else {
