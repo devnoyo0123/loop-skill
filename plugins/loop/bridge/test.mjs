@@ -61,7 +61,9 @@ function control(msg) {
     c.setEncoding('utf8');
     c.once('error', () => resolve(null));
     c.once('connect', () => c.write(JSON.stringify({ id: 1, ...msg }) + '\n'));
-    readline.createInterface({ input: c }).once('line', (l) => { resolve(JSON.parse(l)); c.destroy(); });
+    const rl = readline.createInterface({ input: c });
+    rl.on('error', () => resolve(null));
+    rl.once('line', (l) => { resolve(JSON.parse(l)); c.destroy(); });
   });
 }
 const socketAlive = () =>
@@ -190,6 +192,21 @@ try {
   ok('shim keeps a newer daemon', (await D.tool('bridge_status')).text.includes('Bridge 99.0.0') && newer.exitCode === null);
   D.kill();
   await control({ op: 'shutdown' });
+  await waitFor(async () => !(await socketAlive()), 5000);
+
+  // Stale socket file left by a crashed daemon: the next daemon must take over
+  // and stay up (it used to run onControlReady twice and crash in listenTcp).
+  fs.writeFileSync(ENV.LOOP_BRIDGE_SOCK, '');
+  const revived = spawn(process.execPath, ['daemon.mjs'], { env: ENV, stdio: ['ignore', 'ignore', 'pipe'] });
+  let revivedLog = '';
+  revived.stderr.on('data', (d) => { revivedLog += d; });
+  ok('stale socket → daemon takes over', await waitFor(socketAlive));
+  ok('stale socket → phone port open', await waitFor(portOpen));
+  await sleep(500);
+  ok('stale socket → daemon still running', revived.exitCode === null);
+  ok('stale socket → ready logged once', (revivedLog.match(/ready on/g) ?? []).length === 1);
+  await control({ op: 'shutdown' });
+  await waitFor(async () => revived.exitCode !== null, 3000);
 } finally {
   for (const s of shims) s.kill();
   phoneSocket?.destroy();

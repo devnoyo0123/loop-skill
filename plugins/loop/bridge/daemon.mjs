@@ -431,11 +431,15 @@ function listenControl() {
       } catch {
         /* raced with another daemon */
       }
-      controlServer.listen(CONTROL_SOCK, onControlReady);
+      // No callback here: a listen() callback is a 'listening' listener, and
+      // the first listen() already registered one — passing it again would run
+      // onControlReady twice and crash on the second tcpServer.listen().
+      controlServer.listen(CONTROL_SOCK);
     });
   });
   if (process.platform !== 'win32') fs.mkdirSync(path.dirname(CONTROL_SOCK), { recursive: true });
-  controlServer.listen(CONTROL_SOCK, onControlReady);
+  controlServer.once('listening', onControlReady);
+  controlServer.listen(CONTROL_SOCK);
 }
 
 function onControlReady() {
