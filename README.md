@@ -57,7 +57,7 @@ Search my Loop logs about procrastination
 
 ```bash
 cd plugins/loop/bridge
-node test.mjs          # 42-check E2E: 2 sessions, shared daemon, pairing, phone-advertised tools, upgrade
+node test.mjs          # 47-check E2E: 2 sessions, shared daemon, pairing, phone-advertised tools, upgrade
 ```
 
 - `plugins/loop/bridge/server.mjs` — per-session MCP shim (stdio, zero-dependency node)

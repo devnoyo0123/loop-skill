@@ -260,6 +260,19 @@ try {
   ok('stale socket → ready logged once', (revivedLog.match(/ready on/g) ?? []).length === 1);
   await control({ op: 'shutdown' });
   await waitFor(async () => revived.exitCode !== null, 3000);
+
+  // Two daemons start at once over a stale socket (two sessions restarting
+  // after a crash). Exactly one must survive, reachable, owning the phone port.
+  fs.writeFileSync(ENV.LOOP_BRIDGE_SOCK, '');
+  const racers = [0, 1].map(() => spawn(process.execPath, ['daemon.mjs'], { env: { ...ENV, LOOP_BRIDGE_IDLE_MS: '20000' }, stdio: 'ignore' }));
+  await sleep(2500);
+  const alive = racers.filter((p) => p.exitCode === null);
+  const who = await control({ op: 'whoami' });
+  ok('stale-socket race → exactly one daemon left', alive.length === 1);
+  ok('stale-socket race → survivor answers the socket', typeof who?.pid === 'number' && who.pid === alive[0]?.pid);
+  ok('stale-socket race → phone port open', await waitFor(portOpen));
+  await control({ op: 'shutdown' });
+  await waitFor(async () => racers.every((p) => p.exitCode !== null), 3000);
 } finally {
   for (const s of shims) s.kill();
   phoneSocket?.destroy();

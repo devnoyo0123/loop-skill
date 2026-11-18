@@ -415,6 +415,9 @@ const controlServer = net.createServer((sock) => {
       case 'tools':
         reply({ ok: true, tools: currentPhoneTools() });
         return;
+      case 'whoami': // ownership probe — not a session
+        reply({ ok: true, pid: process.pid });
+        return;
       case 'call': {
         try {
           const r = await callTool(msg.name, msg.args ?? {});
@@ -463,6 +466,12 @@ function listenControl() {
       // No callback here: a listen() callback is a 'listening' listener, and
       // the first listen() already registered one — passing it again would run
       // onControlReady twice and crash on the second tcpServer.listen().
+      // The first 'error' handler was `once` and is spent: if another daemon
+      // re-created the socket in between, lose quietly instead of crashing.
+      controlServer.once('error', () => {
+        log('another daemon won the race — exiting');
+        process.exit(0);
+      });
       controlServer.listen(CONTROL_SOCK);
     });
   });
@@ -475,6 +484,42 @@ function onControlReady() {
   log(`bridge ${VERSION} (pid ${process.pid}) ready on ${CONTROL_SOCK}`);
   armIdle();
   listenTcp();
+  setTimeout(verifyOwnership, 300);
+}
+
+/**
+ * Two daemons racing over a stale socket can both unlink-and-listen; the loser
+ * then holds a socket nobody can reach (and maybe the phone port). Ask the path
+ * who answers — if it isn't us, step aside so the reachable daemon gets the port.
+ */
+function verifyOwnership() {
+  if (shuttingDown) return;
+  const c = net.connect(CONTROL_SOCK);
+  let done = false;
+  const lose = (why) => {
+    if (done) return;
+    done = true;
+    c.destroy();
+    log(`control socket not ours (${why}) — exiting`);
+    // Don't close controlServer: closing a unix-socket server unlinks the path,
+    // which is the winner's socket file now. Exiting just drops our fd.
+    if (phone) send(phone.socket, { t: 'bye' });
+    process.exit(0);
+  };
+  c.setEncoding('utf8');
+  c.once('error', () => lose('unreachable'));
+  c.once('connect', () => c.write(JSON.stringify({ id: 0, op: 'whoami' }) + '\n'));
+  readline.createInterface({ input: c }).once('line', (l) => {
+    let pid = null;
+    try {
+      pid = JSON.parse(l).pid;
+    } catch {
+      /* fallthrough */
+    }
+    if (pid !== process.pid) return lose(`pid ${pid}`);
+    done = true;
+    c.destroy();
+  });
 }
 
 // ── lifecycle ────────────────────────────────────────────────────
