@@ -24,6 +24,9 @@ import {
   STATE_FILE,
   CONTROL_SOCK,
   IDLE_MS,
+  LEGACY_PHONE_TOOLS,
+  BRIDGE_TOOL_NAMES,
+  sanitizePhoneTools,
 } from './common.mjs';
 
 // Test hook: pretend to be another version (exercises the upgrade path).
@@ -124,6 +127,24 @@ function invokeOnPhone(tool, args) {
   });
 }
 
+/** Tools Claude can call on the phone: the last list it advertised, else legacy. */
+function currentPhoneTools() {
+  return Array.isArray(state.phoneTools) && state.phoneTools.length
+    ? state.phoneTools
+    : LEGACY_PHONE_TOOLS;
+}
+
+/** Remember the tool list an authenticated phone advertised; notify sessions on change. */
+function adoptPhoneTools(list) {
+  const tools = sanitizePhoneTools(list);
+  if (!tools) return; // older app (no list) or unusable list — keep what we have
+  if (JSON.stringify(tools) === JSON.stringify(state.phoneTools ?? null)) return;
+  state.phoneTools = tools;
+  saveState();
+  log(`phone tools: ${tools.map((t) => t.name).join(', ')}`);
+  for (const s of shims) send(s, { event: 'tools_changed' });
+}
+
 function onPhoneLine(obj, socket) {
   switch (obj?.t) {
     case 'hello': {
@@ -134,7 +155,7 @@ function onPhoneLine(obj, socket) {
       }
       const dev = state.devices.find((d) => d.id === obj.id);
       if (!dev) {
-        candidates.set(socket, { deviceId: obj.id, attempts: 0 });
+        candidates.set(socket, { deviceId: obj.id, attempts: 0, tools: obj.tools });
         send(socket, { t: 'need_code' });
         return;
       }
@@ -146,6 +167,7 @@ function onPhoneLine(obj, socket) {
       phone = { socket, deviceId: dev.id };
       dev.lastSeen = new Date().toISOString();
       saveState();
+      adoptPhoneTools(obj.tools);
       send(socket, { t: 'paired' });
       log(`phone ${dev.id} reconnected`);
       return;
@@ -187,6 +209,7 @@ function onPhoneLine(obj, socket) {
       candidates.delete(socket);
       phone = { socket, deviceId: cand.deviceId };
       pairingCode = null;
+      adoptPhoneTools(cand.tools);
       send(socket, { t: 'paired', secret });
       log(`phone ${cand.deviceId} paired`);
       return;
@@ -222,6 +245,9 @@ const tcpServer = net.createServer((socket) => {
     return;
   }
   const rl = readline.createInterface({ input: socket });
+  // readline re-emits socket errors (e.g. ECONNRESET when the phone drops off
+  // Wi-Fi). Unhandled, that killed the whole daemon — 'close' below cleans up.
+  rl.on('error', () => {});
   rl.on('line', (line) => {
     if (!line.trim()) return;
     let obj;
@@ -315,10 +341,20 @@ function bridgeStatusText() {
 
 async function callTool(name, args) {
   switch (name) {
-    case 'search_logs':
-    case 'get_log':
-    case 'get_chain':
-    case 'logs_on_day': {
+    case 'bridge_status':
+      return { text: bridgeStatusText() };
+    case 'pairing_code': {
+      const code = codeValid() ? pairingCode.code : makeCode();
+      const mins = Math.max(1, Math.ceil((pairingCode.expiresAt - Date.now()) / 60_000));
+      return {
+        text:
+          `Pairing code: ${code} (valid ${mins} min).\n` +
+          'Tell the user to enter this code in Loop → Settings → PC 연결 on the waiting phone.',
+      };
+    }
+    default: {
+      if (BRIDGE_TOOL_NAMES.includes(name) || !currentPhoneTools().some((t) => t.name === name))
+        return { text: `Unknown tool: ${name}`, isError: true };
       let text;
       try {
         text = await invokeOnPhone(name, args);
@@ -331,26 +367,15 @@ async function callTool(name, args) {
       }
       return { text };
     }
-    case 'bridge_status':
-      return { text: bridgeStatusText() };
-    case 'pairing_code': {
-      const code = codeValid() ? pairingCode.code : makeCode();
-      const mins = Math.max(1, Math.ceil((pairingCode.expiresAt - Date.now()) / 60_000));
-      return {
-        text:
-          `Pairing code: ${code} (valid ${mins} min).\n` +
-          'Tell the user to enter this code in Loop → Settings → PC 연결 on the waiting phone.',
-      };
-    }
-    default:
-      return { text: `Unknown tool: ${name}`, isError: true };
   }
 }
 
 // ── control socket (shims, JSON lines) ───────────────────────────
 //   → {id, op:'hello', version}        ← {id, ok, version, pid}
 //   → {id, op:'call', name, args}      ← {id, ok, text, isError}
+//   → {id, op:'tools'}                 ← {id, ok, tools}  (phone's tool list)
 //   → {id, op:'shutdown'}              ← {id, ok}   (newer shim replacing us)
+//   ← {event:'tools_changed'}          (pushed when the phone advertises a new list)
 
 /** @type {Set<net.Socket>} */
 const shims = new Set();
@@ -371,6 +396,7 @@ const controlServer = net.createServer((sock) => {
   sock.setEncoding('utf8');
   // A connection counts as a Claude session only after 'hello' (probes don't).
   const rl = readline.createInterface({ input: sock });
+  rl.on('error', () => {}); // see the phone socket above — 'close' cleans up
   rl.on('line', async (line) => {
     if (!line.trim()) return;
     let msg;
@@ -385,6 +411,9 @@ const controlServer = net.createServer((sock) => {
         shims.add(sock);
         armIdle();
         reply({ ok: true, version: VERSION, pid: process.pid });
+        return;
+      case 'tools':
+        reply({ ok: true, tools: currentPhoneTools() });
         return;
       case 'call': {
         try {
@@ -465,5 +494,7 @@ function shutdown() {
 }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+// One bad socket must not take the phone link down for every session.
+process.on('uncaughtException', (e) => log('unexpected error (kept running):', e?.stack ?? e));
 
 listenControl();

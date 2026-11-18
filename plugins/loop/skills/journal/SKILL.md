@@ -26,6 +26,16 @@ Tools appear as `mcp__loop__*` automatically once the plugin is installed. No
   the given id, oldest first. Args: `id` (any log id in the chain).
 - `logs_on_day` — all logs written on one day, oldest first. Args: `date`
   (YYYY-MM-DD).
+- `upcoming_loops` — what will come back in the next N days (default 7,
+  max 31), soonest first: one-time loops and 반복 알림 (repeat reminders such
+  as yearly birthdays), each marked alarm or notification. Same list as the
+  app's 다가오는 루프 sheet. Args: `days`. (Loop app 1.0.27+.)
+
+Results also show, under a log, `loop scheduled … (alarm|notification)` and
+`repeat <rule> · next …` when a loop or 반복 알림 is attached to it.
+
+The phone tells the bridge which tools it has, so a newer app can add tools
+without a plugin update. Use whatever tools are listed.
 
 ## Bridge tools
 
@@ -58,6 +68,9 @@ Tools appear as `mcp__loop__*` automatically once the plugin is installed. No
 - **Morning note / 아침 노트**: `logs_on_day` for yesterday and today, plus
   `search_logs` for themes that recur across recent days; end with one or two
   concrete prompts for today.
+- **What's coming up / 다가오는 일정·알림**: `upcoming_loops` (widen `days`
+  for "this month"), then `get_chain` on items that need context. Call them
+  반복 알림 in Korean, not 알람, unless the line says `alarm`.
 - **Weekly or monthly review / 회고**: `search_logs` over the period (several
   narrow queries beat one broad one), `get_chain` on the most repeated topics,
   then a summary grouped by theme with dates.

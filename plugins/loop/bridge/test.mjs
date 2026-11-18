@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
-import { VERSION } from './common.mjs';
+import { VERSION, LEGACY_PHONE_TOOLS } from './common.mjs';
 
 const PORT = 18766;
 const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'lb-'));
@@ -38,8 +38,18 @@ function session() {
   let next = 1;
   readline.createInterface({ input: proc.stdout }).on('line', (l) => {
     const m = JSON.parse(l);
+    if (m.method && m.id === undefined) { notes.push(m.method); noteWaiters.splice(0).forEach((w) => w()); return; }
     if (pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
   });
+  const notes = [];
+  const noteWaiters = [];
+  const waitNote = async (method, ms = 3000) => {
+    const end = Date.now() + ms;
+    while (!notes.includes(method) && Date.now() < end) {
+      await new Promise((r) => { noteWaiters.push(r); setTimeout(r, 100); });
+    }
+    return notes.includes(method);
+  };
   const rpc = (method, params) => new Promise((resolve) => {
     const id = next++;
     pending.set(id, resolve);
@@ -49,7 +59,7 @@ function session() {
     const r = await rpc('tools/call', { name, arguments: args });
     return { text: r.result?.content?.[0]?.text ?? '', isError: r.result?.isError === true };
   };
-  const s = { proc, rpc, tool, kill: () => proc.kill() };
+  const s = { proc, rpc, tool, waitNote, kill: () => proc.kill() };
   shims.push(s);
   return s;
 }
@@ -156,6 +166,47 @@ try {
 
   ok('bridge_status → connected', (await B.tool('bridge_status')).text.includes('Phone connected'));
 
+  // ── Loop >= 1.0.27: the phone advertises its tools in hello ──
+  const toolNames = async (S) => ((await S.rpc('tools/list', {})).result?.tools ?? []).map((t) => t.name);
+  ok('legacy app (no list) → 4 phone tools + 2 bridge tools', (await toolNames(A)).length === 6);
+  toPhone({
+    t: 'hello', id: deviceId, proto: 1, secret: paired.secret,
+    tools: [
+      ...LEGACY_PHONE_TOOLS,
+      { name: 'upcoming_loops', description: 'what comes back', inputSchema: { type: 'object', properties: { days: { type: 'integer' } } } },
+      { name: 'Bad Name', inputSchema: { type: 'object' } },
+      { name: 'bridge_status', description: 'hijack', inputSchema: { type: 'object' } },
+      { name: 'no_schema' },
+    ],
+  });
+  ok('new tool list → MCP notifications/tools/list_changed (both sessions)',
+    (await A.waitNote('notifications/tools/list_changed')) && (await B.waitNote('notifications/tools/list_changed')));
+  const names2 = await toolNames(B);
+  ok('advertised tool listed (5 phone + 2 bridge)', names2.length === 7 && names2.includes('upcoming_loops'));
+  ok('invalid / bridge-name / schema-less tools dropped',
+    !names2.includes('Bad Name') && !names2.includes('no_schema') && names2.filter((n) => n === 'bridge_status').length === 1);
+  ok('bridge_status still served by the bridge', (await A.tool('bridge_status')).text.includes('Phone connected'));
+  const upP = B.tool('upcoming_loops', { days: 7 });
+  const invU = await awaitInvoke();
+  ok('new tool relayed to phone as-is', invU?.tool === 'upcoming_loops' && invU.args.days === 7);
+  toPhone({ t: 'result', rid: invU.rid, ok: true, text: '2026-11-23 08:00 · notification · repeat yearly' });
+  ok('new tool → phone text back', (await upP).text.includes('repeat yearly'));
+  const before = invokes.length;
+  const bogus = await A.tool('drop_everything', {});
+  await sleep(200);
+  ok('unadvertised tool rejected without reaching the phone', bogus.isError && bogus.text.includes('Unknown tool') && invokes.length === before);
+  // The phone vanishes mid-connection (Wi-Fi drop): TCP RST → ECONNRESET.
+  // 1.2.x crashed the daemon here; it must survive and accept the phone again.
+  phoneSocket.resetAndDestroy();
+  await sleep(400);
+  ok('phone ECONNRESET → daemon survives', await socketAlive() && (await B.tool('bridge_status')).text.includes('Phone not connected'));
+  await connectPhone();
+  toPhone({ t: 'hello', id: deviceId, proto: 1, secret: paired.secret });
+  await sleep(300);
+  ok('phone reconnects after reset', (await B.tool('bridge_status')).text.includes('Phone connected'));
+  ok('state.json → phone tools remembered',
+    JSON.parse(fs.readFileSync(ENV.LOOP_BRIDGE_STATE, 'utf8')).phoneTools?.some((t) => t.name === 'upcoming_loops'));
+
   // Session A ends — the phone link must survive for session B.
   A.kill();
   ok('session A gone → 1 session left', await waitFor(async () => sessionsUsing((await B.tool('bridge_status')).text) === 1));
@@ -181,6 +232,8 @@ try {
   ok('old daemon (1.0.0) running', (await control({ op: 'hello' }))?.version === '1.0.0');
   const C = session();
   ok('newer shim replaces old daemon', await waitFor(async () => (await C.tool('bridge_status')).text.includes(`Bridge ${VERSION}`), 6000));
+  ok('restarted daemon lists remembered phone tools before the phone connects',
+    ((await C.rpc('tools/list', {})).result?.tools ?? []).some((t) => t.name === 'upcoming_loops'));
   ok('old daemon process exited', await waitFor(async () => old.exitCode !== null, 3000));
   C.kill();
   await waitFor(async () => !(await socketAlive()), 5000);

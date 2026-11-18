@@ -11,7 +11,13 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { VERSION, CONTROL_SOCK, DAEMON_LOG, compareVersions } from './common.mjs';
+import {
+  VERSION,
+  CONTROL_SOCK,
+  DAEMON_LOG,
+  LEGACY_PHONE_TOOLS,
+  compareVersions,
+} from './common.mjs';
 
 const DAEMON = path.join(path.dirname(fileURLToPath(import.meta.url)), 'daemon.mjs');
 const CALL_TIMEOUT_MS = 40_000; // daemon's phone timeout is 30s
@@ -54,11 +60,19 @@ function request(sock, msg, timeoutMs = CALL_TIMEOUT_MS) {
 function attach(sock) {
   sock.setEncoding('utf8');
   const rl = readline.createInterface({ input: sock });
+  rl.on('error', () => {}); // socket errors are handled by `lost` below
   rl.on('line', (line) => {
     let m;
     try {
       m = JSON.parse(line);
     } catch {
+      return;
+    }
+    if (m.event === 'tools_changed') {
+      // The phone advertised a different tool list — tell Claude to re-list.
+      process.stdout.write(
+        JSON.stringify({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' }) + '\n',
+      );
       return;
     }
     const w = waiting.get(m.id);
@@ -151,6 +165,14 @@ function ensureDaemon() {
   return connecting;
 }
 
+/** The phone's tools as last advertised to the daemon (legacy list if unknown). */
+async function phoneTools() {
+  const sock = await ensureDaemon();
+  if (!sock) return LEGACY_PHONE_TOOLS;
+  const r = await request(sock, { op: 'tools' }, 3_000);
+  return Array.isArray(r.tools) && r.tools.length ? r.tools : LEGACY_PHONE_TOOLS;
+}
+
 async function callTool(name, args) {
   const sock = await ensureDaemon();
   if (!sock) {
@@ -175,70 +197,6 @@ const instructions =
   '`search_logs` first, then `get_log` or `get_chain` for detail. If the ' +
   'phone is not connected, ask the user to open Loop → Settings → PC 연결.';
 
-const dateSchema = {
-  type: 'string',
-  pattern: '^\\d{4}-\\d{2}-\\d{2}$',
-  format: 'date',
-};
-
-const relayTools = [
-  {
-    name: 'search_logs',
-    description:
-      'Full-text search over the journal (content and place). Returns matching ' +
-      'logs with a snippet; matches are wrapped in **. Use get_log or get_chain ' +
-      'with an id for the full text.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        query: {
-          type: 'string',
-          minLength: 1,
-          maxLength: 200,
-          description: 'Text to find. 3+ characters use the index.',
-        },
-        limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
-        from: { ...dateSchema, description: 'Start date YYYY-MM-DD (inclusive, local time).' },
-        to: { ...dateSchema, description: 'End date YYYY-MM-DD (inclusive, local time).' },
-        order: { type: 'string', enum: ['recent', 'relevance'], default: 'recent' },
-      },
-      required: ['query'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'get_log',
-    description: 'One log in full, with metadata.',
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'string', minLength: 1 } },
-      required: ['id'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'get_chain',
-    description:
-      'The whole chain (original log and all follow-ups) containing the given ' +
-      'log id, oldest first.',
-    inputSchema: {
-      type: 'object',
-      properties: { id: { type: 'string', minLength: 1, description: 'Any log id in the chain.' } },
-      required: ['id'],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: 'logs_on_day',
-    description: 'All logs written on one day (local time), oldest first, up to 50.',
-    inputSchema: {
-      type: 'object',
-      properties: { date: { ...dateSchema, description: 'YYYY-MM-DD' } },
-      required: ['date'],
-      additionalProperties: false,
-    },
-  },
-];
 
 const bridgeTools = [
   {
@@ -279,7 +237,7 @@ async function handleMcp(msg) {
           protocolVersion: supportedVersions.includes(params?.protocolVersion)
             ? params.protocolVersion
             : supportedVersions[0],
-          capabilities: { tools: { listChanged: false } },
+          capabilities: { tools: { listChanged: true } },
           serverInfo: { name: 'loop', version: VERSION },
           instructions,
         },
@@ -290,7 +248,7 @@ async function handleMcp(msg) {
       return {
         jsonrpc: '2.0',
         id,
-        result: { tools: [...relayTools, ...bridgeTools] },
+        result: { tools: [...(await phoneTools()), ...bridgeTools] },
       };
     case 'tools/call': {
       const name = params?.name;
