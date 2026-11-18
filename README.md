@@ -7,8 +7,14 @@ and reconnects automatically. Search your journal, build morning notes and revie
 all read-only, all on your local network.
 
 ```
-Claude Code ─ stdio ─ bridge (this plugin) ─ LAN ─ Loop app (data stays on the phone)
+Claude Code session A ─ stdio ─ shim ─┐
+Claude Code session B ─ stdio ─ shim ─┼─ local socket ─ bridge daemon ─ LAN ─ Loop app
+Claude Code session C ─ stdio ─ shim ─┘                                  (data stays on the phone)
 ```
+
+Every Claude Code session gets a thin shim; one shared bridge daemon (started
+on demand, exits 10 min after the last session closes) holds the phone link
+and the pairing code. So pairing and searching work from any session.
 
 ## Requirements
 
@@ -51,10 +57,12 @@ Search my Loop logs about procrastination
 
 ```bash
 cd plugins/loop/bridge
-node test.mjs          # 16-check E2E: stdio MCP + TCP link + pairing
+node test.mjs          # 28-check E2E: 2 sessions, shared daemon, pairing, upgrade
 ```
 
-- `plugins/loop/bridge/server.mjs` — the bridge (zero-dependency node)
+- `plugins/loop/bridge/server.mjs` — per-session MCP shim (stdio, zero-dependency node)
+- `plugins/loop/bridge/daemon.mjs` — shared bridge daemon: phone TCP link (port 8766),
+  pairing, control socket `~/.loop-bridge/bridge.sock`, log `~/.loop-bridge/daemon.log`
 - Design: `docs/mcp-bridge-design.md` · decision: `docs/adr-002-desktop-mcp-bridge.md`
   in the Loop app repo
 

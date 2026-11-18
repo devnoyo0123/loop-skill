@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// E2E self-test: drives bridge/server.mjs as an MCP client (stdio) and as a
-// fake phone (TCP). Isolated port + state file — safe to run anywhere.
+// E2E self-test for the shared bridge: two Claude sessions (shims over stdio),
+// one daemon, one fake phone (TCP). Isolated port, state, socket and log —
+// safe to run next to a real bridge.
 // Usage: node test.mjs
 
 import { spawn } from 'node:child_process';
@@ -9,12 +10,19 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import { VERSION } from './common.mjs';
 
 const PORT = 18766;
-const STATE = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'loop-bridge-')), 'state.json');
-const server = spawn(process.execPath, ['server.mjs'], {
-  env: { ...process.env, LOOP_BRIDGE_PORT: String(PORT), LOOP_BRIDGE_STATE: STATE },
-});
+const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'lb-'));
+const ENV = {
+  ...process.env,
+  LOOP_BRIDGE_PORT: String(PORT),
+  LOOP_BRIDGE_STATE: path.join(DIR, 'state.json'),
+  LOOP_BRIDGE_SOCK: path.join(DIR, 'b.sock'),
+  LOOP_BRIDGE_LOG: path.join(DIR, 'daemon.log'),
+  LOOP_BRIDGE_IDLE_MS: '1500',
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 let pass = 0, fail = 0;
 const ok = (name, cond) => {
@@ -22,149 +30,172 @@ const ok = (name, cond) => {
   else { fail++; console.log(`FAIL  ${name}`); }
 };
 
-// ── MCP client side (child stdio) ──
-const mcpPending = new Map();
-let mcpNext = 1;
-const mcpLines = readline.createInterface({ input: server.stdout });
-mcpLines.on('line', (l) => {
-  const m = JSON.parse(l);
-  if (m.id !== null && mcpPending.has(m.id)) { mcpPending.get(m.id)(m); mcpPending.delete(m.id); }
-});
-function rpc(method, params) {
-  return new Promise((resolve) => {
-    const id = mcpNext++;
-    mcpPending.set(id, resolve);
-    server.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+// ── a Claude session = one shim process driven over stdio ──
+const shims = [];
+function session() {
+  const proc = spawn(process.execPath, ['server.mjs'], { env: ENV });
+  const pending = new Map();
+  let next = 1;
+  readline.createInterface({ input: proc.stdout }).on('line', (l) => {
+    const m = JSON.parse(l);
+    if (pending.has(m.id)) { pending.get(m.id)(m); pending.delete(m.id); }
   });
+  const rpc = (method, params) => new Promise((resolve) => {
+    const id = next++;
+    pending.set(id, resolve);
+    proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+  });
+  const tool = async (name, args = {}) => {
+    const r = await rpc('tools/call', { name, arguments: args });
+    return { text: r.result?.content?.[0]?.text ?? '', isError: r.result?.isError === true };
+  };
+  const s = { proc, rpc, tool, kill: () => proc.kill() };
+  shims.push(s);
+  return s;
 }
 
-// ── fake phone side (TCP, lazy — bridge needs a moment to listen) ──
-let phoneSocket = null;
-let phoneGot = null;               // last {invoke} from bridge
-const phoneWaiters = [];
-let last = null;                   // most recent phone-side message
-let issuedSecret = null;
-
-async function connectPhone() {
-  phoneSocket = await new Promise((resolve, reject) => {
-    const tryOnce = (n) => {
-      const s = net.connect(PORT, '127.0.0.1');
-      s.once('connect', () => resolve(s));
-      s.once('error', () => {
-        s.destroy();
-        if (n > 40) reject(new Error('bridge tcp listener never came up'));
-        else setTimeout(() => tryOnce(n + 1), 150);
-      });
-    };
-    tryOnce(0);
+/** Talk to the daemon's control socket directly (like a shim would). */
+function control(msg) {
+  return new Promise((resolve) => {
+    const c = net.connect(ENV.LOOP_BRIDGE_SOCK);
+    c.setEncoding('utf8');
+    c.once('error', () => resolve(null));
+    c.once('connect', () => c.write(JSON.stringify({ id: 1, ...msg }) + '\n'));
+    readline.createInterface({ input: c }).once('line', (l) => { resolve(JSON.parse(l)); c.destroy(); });
   });
+}
+const socketAlive = () =>
+  new Promise((r) => { const c = net.connect(ENV.LOOP_BRIDGE_SOCK); c.once('connect', () => { c.destroy(); r(true); }); c.once('error', () => r(false)); });
+const portOpen = () =>
+  new Promise((r) => { const c = net.connect(PORT, '127.0.0.1'); c.once('connect', () => { c.destroy(); r(true); }); c.once('error', () => r(false)); });
+async function waitFor(cond, ms = 4000) {
+  for (let t = 0; t < ms; t += 100) { if (await cond()) return true; await sleep(100); }
+  return false;
+}
+const sessionsUsing = (text) => Number(text.match(/sessions using this bridge: (\d+)/)?.[1]);
+
+// ── fake phone (TCP JSON lines) ──
+let phoneSocket = null;
+let last = null;
+const invokes = [];
+const invokeWaiters = [];
+async function connectPhone() {
+  await waitFor(portOpen);
+  phoneSocket = net.connect(PORT, '127.0.0.1');
+  await new Promise((r) => phoneSocket.once('connect', r));
   phoneSocket.setEncoding('utf8');
   phoneSocket.on('error', () => {});
-  const rl = readline.createInterface({ input: phoneSocket });
-  rl.on('line', (l) => {
+  readline.createInterface({ input: phoneSocket }).on('line', (l) => {
     const m = JSON.parse(l);
     last = m;
-    if (m.t === 'paired' && m.secret) issuedSecret = m.secret;
     if (m.t === 'invoke') {
-      if (phoneWaiters.length) phoneWaiters.shift()(m);
-      else phoneGot = m;
+      if (invokeWaiters.length) invokeWaiters.shift()(m);
+      else invokes.push(m);
     }
   });
 }
 const toPhone = (o) => phoneSocket.write(JSON.stringify(o) + '\n');
-const awaitInvoke = () => {
-  if (phoneGot) {
-    const g = phoneGot;
-    phoneGot = null;
-    return Promise.resolve(g);
-  }
-  return new Promise((r) => phoneWaiters.push(r));
-};
+const awaitInvoke = () => invokes.length ? Promise.resolve(invokes.shift()) : new Promise((r) => invokeWaiters.push(r));
+async function phoneMsg() { await sleep(300); return last; }
 
 // ── scenario ──
 const deviceId = 'test-phone-' + Date.now();
 try {
-  const init = await rpc('initialize', { protocolVersion: '2025-06-18' });
-  ok('initialize → serverInfo', init.result?.serverInfo?.name === 'loop');
+  // Two sessions start at the same time — must end up on ONE daemon.
+  const A = session();
+  const B = session();
+
+  const init = await A.rpc('initialize', { protocolVersion: '2025-06-18' });
+  ok('initialize → serverInfo', init.result?.serverInfo?.name === 'loop' && init.result.serverInfo.version === VERSION);
   ok('initialize → echoes requested protocolVersion', init.result?.protocolVersion === '2025-06-18');
+  const list = await B.rpc('tools/list', {});
+  const names = list.result?.tools?.map((t) => t.name) ?? [];
+  ok('tools/list → 6 tools', names.length === 6 &&
+    ['search_logs', 'get_log', 'get_chain', 'logs_on_day', 'bridge_status', 'pairing_code'].every((n) => names.includes(n)));
 
-  const list = await rpc('tools/list', {});
-  const names = list.result?.tools?.map((t) => t.name);
-  ok('tools/list → 6 tools', names?.length === 6);
-  ok('tools/list → relay+bridge tools present',
-    ['search_logs', 'get_log', 'get_chain', 'logs_on_day', 'bridge_status', 'pairing_code']
-      .every((n) => names.includes(n)));
+  ok('both sessions share one daemon', await waitFor(async () => sessionsUsing((await A.tool('bridge_status')).text) === 2));
+  ok('daemon owns the phone port', await waitFor(portOpen));
 
-  // unpaired search → isError with guidance
-  const s0 = await rpc('tools/call', { name: 'search_logs', arguments: { query: 'x' } });
-  ok('search without phone → isError', s0.result?.isError === true);
+  ok('search without phone → isError', (await A.tool('search_logs', { query: 'x' })).isError);
 
   await connectPhone();
-
-  // phone hello (new device) → need_code
   toPhone({ t: 'hello', id: deviceId, proto: 1 });
-  await new Promise((r) => setTimeout(r, 300));
-  const hello1 = await lastPhoneMsg();
-  ok('hello (new) → need_code', hello1?.t === 'need_code');
+  ok('hello (new) → need_code', (await phoneMsg())?.t === 'need_code');
 
-  // pairing code via MCP
-  const codeRes = await rpc('tools/call', { name: 'pairing_code', arguments: {} });
-  const code = codeRes.result?.content?.[0]?.text?.match(/(\d{8})/)?.[1];
-  ok('pairing_code → 8 digits', !!code);
+  // THE BUG: code from session B must be the one the phone's bridge expects.
+  const code = (await B.tool('pairing_code')).text.match(/(\d{8})/)?.[1];
+  ok('pairing_code (session B) → 8 digits', !!code);
+  ok('pairing_code (session A) → same code', (await A.tool('pairing_code')).text.includes(code));
 
-  // wrong code once → attemptsLeft
-  toPhone({ t: 'pair', code: '00000000' });
-  await new Promise((r) => setTimeout(r, 300));
-  ok('wrong code → need_code + attemptsLeft', (await lastPhoneMsg())?.attemptsLeft === 4);
+  toPhone({ t: 'pair', code: code === '00000000' ? '11111111' : '00000000' });
+  ok('wrong code → need_code + attemptsLeft', (await phoneMsg())?.attemptsLeft === 4);
 
-  // correct code → paired + secret
   toPhone({ t: 'pair', code });
-  await new Promise((r) => setTimeout(r, 300));
-  const paired = await lastPhoneMsg();
-  ok('pair → paired + secret', paired?.t === 'paired' && typeof paired.secret === 'string' && paired.secret.length >= 40);
-  issuedSecret = paired.secret;
+  const paired = await phoneMsg();
+  ok('pair with session B code → paired + secret', paired?.t === 'paired' && paired.secret?.length >= 40);
 
-  // state file persisted
-  const saved = JSON.parse(fs.readFileSync(STATE, 'utf8'));
+  const saved = JSON.parse(fs.readFileSync(ENV.LOOP_BRIDGE_STATE, 'utf8'));
   ok('state.json → device saved', saved.devices.some((d) => d.id === deviceId));
 
-  // relay: search_logs
-  const searchP = rpc('tools/call', { name: 'search_logs', arguments: { query: '망원경' } });
-  const inv = await awaitInvoke();
-  ok('bridge → invoke on phone', inv?.tool === 'search_logs' && inv.args.query === '망원경');
-  toPhone({ t: 'result', rid: inv.rid, ok: true, text: '가짜검색결과 3건' });
-  const search = await searchP;
-  ok('search_logs → relayed text', search.result?.content?.[0]?.text === '가짜검색결과 3건' && !search.result.isError);
+  for (const [label, S] of [['A', A], ['B', B]]) {
+    const p = S.tool('search_logs', { query: '망원경' });
+    const inv = await awaitInvoke();
+    ok(`session ${label} → invoke on phone`, inv?.tool === 'search_logs' && inv.args.query === '망원경');
+    toPhone({ t: 'result', rid: inv.rid, ok: true, text: `결과-${label}` });
+    const r = await p;
+    ok(`session ${label} search → relayed text`, r.text === `결과-${label}` && !r.isError);
+  }
 
-  // relay: phone-side error
-  const errP = rpc('tools/call', { name: 'get_log', arguments: { id: 'nope' } });
+  const errP = A.tool('get_log', { id: 'nope' });
   const inv2 = await awaitInvoke();
   toPhone({ t: 'result', rid: inv2.rid, ok: false, error: 'No such log: nope' });
   const errRes = await errP;
-  ok('phone error → isError with message', errRes.result?.isError === true && errRes.result.content[0].text.includes('No such log'));
+  ok('phone error → isError with message', errRes.isError && errRes.text.includes('No such log'));
 
-  // status shows connected
-  const st = await rpc('tools/call', { name: 'bridge_status', arguments: {} });
-  ok('bridge_status → connected', st.result?.content?.[0]?.text.includes('Phone connected'));
+  ok('bridge_status → connected', (await B.tool('bridge_status')).text.includes('Phone connected'));
 
-  // disconnect → next search fails gracefully
+  // Session A ends — the phone link must survive for session B.
+  A.kill();
+  ok('session A gone → 1 session left', await waitFor(async () => sessionsUsing((await B.tool('bridge_status')).text) === 1));
+  const pB = B.tool('search_logs', { query: '계속' });
+  const inv3 = await awaitInvoke();
+  toPhone({ t: 'result', rid: inv3.rid, ok: true, text: '여전히 연결됨' });
+  ok('session B still searches after A quit', (await pB).text === '여전히 연결됨');
+
   phoneSocket.destroy();
-  await new Promise((r) => setTimeout(r, 300));
-  const s1 = await rpc('tools/call', { name: 'search_logs', arguments: { query: 'x' } });
-  ok('search after disconnect → isError', s1.result?.isError === true);
+  await sleep(300);
+  ok('search after phone disconnect → isError', (await B.tool('search_logs', { query: 'x' })).isError);
 
-  // unknown method
-  const bad = await rpc('no/such', {});
-  ok('unknown method → -32601', bad.error?.code === -32601);
+  ok('unknown method → -32601', (await B.rpc('no/such', {})).error?.code === -32601);
+
+  // Last session ends → daemon exits after IDLE_MS (1.5s in this test).
+  B.kill();
+  ok('no sessions → daemon exits (socket closed)', await waitFor(async () => !(await socketAlive()), 5000));
+  ok('no sessions → phone port released', await waitFor(async () => !(await portOpen()), 3000));
+
+  // Upgrade: an older daemon is running; a newer shim replaces it.
+  const old = spawn(process.execPath, ['daemon.mjs'], { env: { ...ENV, LOOP_BRIDGE_DAEMON_VERSION: '1.0.0' }, stdio: 'ignore' });
+  await waitFor(socketAlive);
+  ok('old daemon (1.0.0) running', (await control({ op: 'hello' }))?.version === '1.0.0');
+  const C = session();
+  ok('newer shim replaces old daemon', await waitFor(async () => (await C.tool('bridge_status')).text.includes(`Bridge ${VERSION}`), 6000));
+  ok('old daemon process exited', await waitFor(async () => old.exitCode !== null, 3000));
+  C.kill();
+  await waitFor(async () => !(await socketAlive()), 5000);
+
+  // Downgrade guard: an older shim must NOT kill a newer daemon.
+  const newer = spawn(process.execPath, ['daemon.mjs'], { env: { ...ENV, LOOP_BRIDGE_DAEMON_VERSION: '99.0.0' }, stdio: 'ignore' });
+  await waitFor(socketAlive);
+  const D = session();
+  ok('shim keeps a newer daemon', (await D.tool('bridge_status')).text.includes('Bridge 99.0.0') && newer.exitCode === null);
+  D.kill();
+  await control({ op: 'shutdown' });
 } finally {
-  server.kill();
-  phoneSocket.destroy();
-  fs.rmSync(path.dirname(STATE), { recursive: true, force: true });
+  for (const s of shims) s.kill();
+  phoneSocket?.destroy();
+  await control({ op: 'shutdown' }).catch(() => {});
+  await sleep(200);
+  fs.rmSync(DIR, { recursive: true, force: true });
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
-}
-
-// crude helper: most recent phone-side message (tests are sequential)
-function lastPhoneMsg() {
-  return Promise.resolve(last);
 }

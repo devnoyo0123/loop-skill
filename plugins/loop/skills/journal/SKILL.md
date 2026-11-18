@@ -75,7 +75,8 @@ Tools appear as `mcp__loop__*` automatically once the plugin is installed. No
 | No `mcp__loop__*` tools at all | Plugin not enabled or `node` (≥18) missing — check `/plugin` and `node -v` |
 | Search says "Phone not connected" | Phone not linked → phone app → PC 연결, keep app in foreground |
 | Phone can't find the Mac | Auto-discovery missed → enter the Mac IP manually: `ipconfig getifaddr en0`, port 8766 |
-| "Another Claude session owns the phone link" | A second session's bridge can't share the port — close the other session, or use the session that started first |
+| "Port 8766 is held by another program" | Usually an older Loop plugin (< 1.2) still running in another Claude Code session — update the plugin and restart that session; the bridge takes the port over by itself |
+| Bridge won't start | Check `~/.loop-bridge/daemon.log` |
 | "did not answer within 30s" | Phone app backgrounded or locked → bring Loop to the foreground and retry |
 | Firewall prompt on first run | Allow incoming connections for node — the phone initiates, the Mac accepts |
 | Phone was reinstalled / new device | Old pairing invalid — pair again with a fresh `pairing_code` |

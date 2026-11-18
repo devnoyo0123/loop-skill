@@ -1,267 +1,168 @@
 #!/usr/bin/env node
-// Loop bridge — stdio MCP server for Claude Code + TCP JSON-lines link for the
-// Loop phone app. Design: docs/mcp-bridge-design.md (loop repo, ADR-002).
+// Loop MCP shim — one per Claude Code session (stdio). It owns nothing: tool
+// calls are forwarded to the shared bridge daemon (daemon.mjs) over a local
+// socket, so every session sees the same phone link and pairing code. Starts
+// the daemon on demand and replaces it when this plugin is newer.
 // Zero dependencies, node >= 18.
 
 import net from 'node:net';
-import crypto from 'node:crypto';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { VERSION, CONTROL_SOCK, DAEMON_LOG, compareVersions } from './common.mjs';
 
-/** First LAN IPv4 of this Mac — shown in bridge_status for manual phone entry. */
-function lanIp() {
-  for (const ifaces of Object.values(os.networkInterfaces())) {
-    for (const i of ifaces ?? []) {
-      if (i.family === 'IPv4' && !i.internal) return i.address;
-    }
-  }
-  return null;
+const DAEMON = path.join(path.dirname(fileURLToPath(import.meta.url)), 'daemon.mjs');
+const CALL_TIMEOUT_MS = 40_000; // daemon's phone timeout is 30s
+const log = (...a) => process.stderr.write('loop-shim: ' + a.join(' ') + '\n');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ── daemon link ──────────────────────────────────────────────────
+
+/** @type {net.Socket | null} */
+let link = null;
+let nextId = 1;
+/** id -> {resolve, timer} */
+const waiting = new Map();
+let connecting = null;
+let closed = false;
+
+function tryConnect() {
+  return new Promise((resolve) => {
+    const s = net.connect(CONTROL_SOCK);
+    s.once('connect', () => resolve(s));
+    s.once('error', () => {
+      s.destroy();
+      resolve(null);
+    });
+  });
 }
 
-const TCP_PORT = Number(process.env.LOOP_BRIDGE_PORT || 8766);
-const STATE_FILE =
-  process.env.LOOP_BRIDGE_STATE ||
-  path.join(os.homedir(), '.loop-bridge', 'state.json');
-const TOOL_TIMEOUT_MS = 30_000;
-const CODE_TTL_MS = 5 * 60_000;
-const CODE_MAX_ATTEMPTS = 5;
-
-const log = (...a) => process.stderr.write(a.join(' ') + '\n');
-
-// ── pairing state ────────────────────────────────────────────────
-
-let state = { devices: [] };
-
-function loadState() {
-  try {
-    state = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  } catch {
-    /* first run */
-  }
-  if (!Array.isArray(state.devices)) state = { devices: [] };
-}
-
-function saveState() {
-  try {
-    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
-  } catch (e) {
-    log('loop-bridge: state write failed:', e.message);
-  }
-}
-
-loadState();
-
-// ── phone link (TCP JSON lines) ──────────────────────────────────
-
-/** @type {{socket: net.Socket, deviceId: string} | null} */
-let phone = null;
-/** Candidates that said hello but are not paired yet. socket -> {deviceId, attempts} */
-const candidates = new Map();
-/** @type {{code: string, expiresAt: number} | null} */
-let pairingCode = null;
-let nextRid = 1;
-/** rid -> {resolve, reject, timer} */
-const pendingCalls = new Map();
-
-function send(socket, obj) {
-  socket.write(JSON.stringify(obj) + '\n');
-}
-
-function makeCode() {
-  const n = crypto.randomInt(0, 100_000_000);
-  pairingCode = {
-    code: String(n).padStart(8, '0'),
-    expiresAt: Date.now() + CODE_TTL_MS,
-  };
-  return pairingCode.code;
-}
-
-function codeValid() {
-  return pairingCode && Date.now() < pairingCode.expiresAt;
-}
-
-function failPending(msg) {
-  for (const [, p] of pendingCalls) {
-    clearTimeout(p.timer);
-    p.reject(new Error(msg));
-  }
-  pendingCalls.clear();
-}
-
-/** Relay a tool call to the phone. Rejects if no phone is connected. */
-function invokeOnPhone(tool, args) {
-  return new Promise((resolve, reject) => {
-    if (!phone) {
-      reject(new Error('PHONE_NOT_CONNECTED'));
-      return;
-    }
-    const rid = nextRid++;
+function request(sock, msg, timeoutMs = CALL_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const id = nextId++;
     const timer = setTimeout(() => {
-      pendingCalls.delete(rid);
-      reject(new Error('PHONE_TIMEOUT'));
-    }, TOOL_TIMEOUT_MS);
-    pendingCalls.set(rid, { resolve, reject, timer });
-    send(phone.socket, { t: 'invoke', rid, tool, args: args ?? {} });
+      waiting.delete(id);
+      resolve({ ok: false, text: 'The Loop bridge did not answer in time.', isError: true });
+    }, timeoutMs);
+    waiting.set(id, { resolve, timer });
+    sock.write(JSON.stringify({ id, ...msg }) + '\n');
   });
 }
 
-function onPhoneLine(obj, socket) {
-  switch (obj?.t) {
-    case 'hello': {
-      if (obj.proto !== 1) {
-        send(socket, { t: 'bye', reason: 'proto' });
-        socket.end();
-        return;
-      }
-      const dev = state.devices.find((d) => d.id === obj.id);
-      if (!dev) {
-        candidates.set(socket, { deviceId: obj.id, attempts: 0 });
-        send(socket, { t: 'need_code' });
-        return;
-      }
-      if (dev.secret !== obj.secret) {
-        send(socket, { t: 'bye', reason: 'secret' });
-        socket.end();
-        return;
-      }
-      phone = { socket, deviceId: dev.id };
-      dev.lastSeen = new Date().toISOString();
-      saveState();
-      send(socket, { t: 'paired' });
-      log(`loop-bridge: phone ${dev.id} reconnected`);
-      return;
-    }
-    case 'pair': {
-      const cand = candidates.get(socket);
-      if (!cand) {
-        send(socket, { t: 'bye', reason: 'hello_first' });
-        socket.end();
-        return;
-      }
-      if (!codeValid()) {
-        send(socket, { t: 'bye', reason: 'code_expired' });
-        socket.end();
-        return;
-      }
-      if (obj.code !== pairingCode.code) {
-        cand.attempts++;
-        const left = CODE_MAX_ATTEMPTS - cand.attempts;
-        if (left <= 0) {
-          candidates.delete(socket);
-          send(socket, { t: 'bye', reason: 'too_many' });
-          socket.end();
-        } else {
-          send(socket, { t: 'need_code', attemptsLeft: left });
-        }
-        return;
-      }
-      // paired — issue secret, remember device, promote socket to phone
-      const secret = crypto.randomBytes(32).toString('base64url');
-      state.devices.push({
-        id: cand.deviceId,
-        secret,
-        name: obj.name ?? null,
-        lastSeen: new Date().toISOString(),
-      });
-      saveState();
-      candidates.delete(socket);
-      phone = { socket, deviceId: cand.deviceId };
-      pairingCode = null;
-      send(socket, { t: 'paired', secret });
-      log(`loop-bridge: phone ${cand.deviceId} paired`);
-      return;
-    }
-    case 'ping':
-      send(socket, { t: 'pong' });
-      return;
-    case 'result': {
-      const p = pendingCalls.get(obj.rid);
-      if (!p) return;
-      pendingCalls.delete(obj.rid);
-      clearTimeout(p.timer);
-      if (obj.ok) p.resolve(obj.text ?? '');
-      else p.reject(Object.assign(new Error(obj.error ?? 'phone error'), { phoneError: true }));
-      return;
-    }
-    case 'bye':
-      socket.end();
-      return;
-    default:
-      send(socket, { t: 'bye', reason: 'unknown' });
-  }
-}
-
-let tcpBusy = false;
-
-const tcpServer = net.createServer((socket) => {
-  socket.setEncoding('utf8');
-  if (phone) {
-    // One phone per bridge (design §1.1) — later sessions share the owner.
-    send(socket, { t: 'busy' });
-    socket.end();
-    return;
-  }
-  const rl = readline.createInterface({ input: socket });
+function attach(sock) {
+  sock.setEncoding('utf8');
+  const rl = readline.createInterface({ input: sock });
   rl.on('line', (line) => {
-    if (!line.trim()) return;
-    let obj;
+    let m;
     try {
-      obj = JSON.parse(line);
+      m = JSON.parse(line);
     } catch {
-      send(socket, { t: 'bye', reason: 'bad_json' });
-      socket.end();
       return;
     }
-    onPhoneLine(obj, socket);
+    const w = waiting.get(m.id);
+    if (!w) return;
+    waiting.delete(m.id);
+    clearTimeout(w.timer);
+    w.resolve(m);
   });
-  const drop = () => {
-    candidates.delete(socket);
-    if (phone && phone.socket === socket) {
-      phone = null;
-      failPending('PHONE_DISCONNECTED');
-      log('loop-bridge: phone disconnected');
+  const lost = () => {
+    if (link !== sock) return;
+    link = null;
+    for (const [, w] of waiting) {
+      clearTimeout(w.timer);
+      w.resolve({ ok: false, text: 'The Loop bridge restarted — please try again.', isError: true });
     }
+    waiting.clear();
+    // Keep a daemon alive for this session (also keeps the phone port open).
+    if (!closed) setTimeout(() => ensureDaemon().catch(() => {}), 500);
   };
-  socket.on('close', drop);
-  socket.on('error', drop);
-});
+  sock.on('close', lost);
+  sock.on('error', lost);
+}
 
-tcpServer.on('error', (e) => {
-  if (e.code === 'EADDRINUSE') {
-    tcpBusy = true;
-    log(`loop-bridge: port ${TCP_PORT} in use — another session owns the phone link`);
-  } else {
-    log('loop-bridge: tcp error:', e.message);
-  }
-});
-
-tcpServer.listen(TCP_PORT, () => {
-  log(`loop-bridge: listening on ${TCP_PORT} for the phone`);
-  advertise();
-});
-
-// ── mDNS advertisement (system binary, best-effort) ──────────────
-
-let mdns = null;
-
-function advertise() {
+function startDaemon() {
+  let out = 'ignore';
   try {
-    const cmd =
-      process.platform === 'darwin'
-        ? ['dns-sd', ['-R', 'Loop Bridge', '_loop-bridge._tcp', '.', String(TCP_PORT)]]
-        : process.platform === 'linux'
-          ? ['avahi-publish-service', ['Loop Bridge', '_loop-bridge._tcp', String(TCP_PORT)]]
-          : null;
-    if (!cmd) return;
-    mdns = spawn(cmd[0], cmd[1], { stdio: 'ignore' });
-    mdns.on('error', () => (mdns = null)); // not installed — manual IP entry still works
+    fs.mkdirSync(path.dirname(DAEMON_LOG), { recursive: true });
+    try {
+      if (fs.statSync(DAEMON_LOG).size > 1_000_000) fs.truncateSync(DAEMON_LOG, 0);
+    } catch {
+      /* no log yet */
+    }
+    out = fs.openSync(DAEMON_LOG, 'a');
   } catch {
-    mdns = null;
+    /* log is best-effort */
   }
+  const child = spawn(process.execPath, [DAEMON], {
+    detached: true,
+    stdio: ['ignore', out, out],
+    env: process.env,
+  });
+  child.unref();
+  if (typeof out === 'number') fs.closeSync(out);
+}
+
+async function connectOrStart() {
+  let sock = await tryConnect();
+  if (sock) return sock;
+  startDaemon();
+  for (let i = 0; i < 40 && !sock; i++) {
+    await sleep(100);
+    sock = await tryConnect();
+  }
+  return sock;
+}
+
+/** Connect to the daemon, starting or upgrading it as needed. */
+function ensureDaemon() {
+  if (link) return Promise.resolve(link);
+  if (connecting) return connecting;
+  connecting = (async () => {
+    try {
+      for (let round = 0; round < 3; round++) {
+        const sock = await connectOrStart();
+        if (!sock) return null;
+        attach(sock);
+        const hi = await request(sock, { op: 'hello', version: VERSION }, 3_000);
+        if (hi.ok && compareVersions(VERSION, hi.version) > 0) {
+          // Older daemon (plugin was updated): replace it with ours.
+          log(`replacing bridge ${hi.version} with ${VERSION}`);
+          await request(sock, { op: 'shutdown' }, 3_000);
+          sock.destroy();
+          for (let i = 0; i < 30 && (await tryConnect().then((s) => (s?.destroy(), !!s))); i++) {
+            await sleep(100);
+          }
+          continue;
+        }
+        if (!hi.ok) {
+          sock.destroy();
+          continue;
+        }
+        link = sock;
+        return sock;
+      }
+      return null;
+    } finally {
+      connecting = null;
+    }
+  })();
+  return connecting;
+}
+
+async function callTool(name, args) {
+  const sock = await ensureDaemon();
+  if (!sock) {
+    return {
+      text:
+        `Could not start the Loop bridge. Check ${DAEMON_LOG} and that node can ` +
+        `create ${CONTROL_SOCK}.`,
+      isError: true,
+    };
+  }
+  const r = await request(sock, { op: 'call', name, args });
+  return { text: r.text ?? '', isError: r.isError === true || r.ok === false };
 }
 
 // ── MCP over stdio ───────────────────────────────────────────────
@@ -366,58 +267,6 @@ function rpcError(id, code, message) {
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
 
-function bridgeStatusText() {
-  const lines = [];
-  if (tcpBusy) lines.push(`Another Claude session owns the phone link (port ${TCP_PORT} in use).`);
-  const ip = lanIp();
-  if (ip) lines.push(`This Mac's address for the phone: ${ip} (port ${TCP_PORT}).`);
-  if (phone) {
-    lines.push(`Phone connected (device ${phone.deviceId}).`);
-  } else {
-    lines.push('Phone not connected.');
-    lines.push(
-      'Ask the user to open Loop → Settings → PC 연결 on the phone and connect ' +
-        `to this Mac (port ${TCP_PORT}).`,
-    );
-  }
-  lines.push(`Paired devices on this Mac: ${state.devices.length}.`);
-  return lines.join('\n');
-}
-
-async function callTool(name, args) {
-  switch (name) {
-    case 'search_logs':
-    case 'get_log':
-    case 'get_chain':
-    case 'logs_on_day': {
-      let text;
-      try {
-        text = await invokeOnPhone(name, args);
-      } catch (e) {
-        if (e.message === 'PHONE_NOT_CONNECTED' || e.message === 'PHONE_DISCONNECTED')
-          return { text: bridgeStatusText(), isError: true };
-        if (e.message === 'PHONE_TIMEOUT')
-          return { text: 'The phone did not answer within 30s. Is the app open in the foreground?', isError: true };
-        return { text: String(e.message), isError: true };
-      }
-      return { text };
-    }
-    case 'bridge_status':
-      return { text: bridgeStatusText() };
-    case 'pairing_code': {
-      const code = codeValid() ? pairingCode.code : makeCode();
-      const mins = Math.max(1, Math.ceil((pairingCode.expiresAt - Date.now()) / 60_000));
-      return {
-        text:
-          `Pairing code: ${code} (valid ${mins} min).\n` +
-          'Tell the user to enter this code in Loop → Settings → PC 연결 on the waiting phone.',
-      };
-    }
-    default:
-      return { text: `Unknown tool: ${name}`, isError: true };
-  }
-}
-
 async function handleMcp(msg) {
   const { id, method, params } = msg;
   if (id === undefined || id === null) return null; // notification
@@ -431,7 +280,7 @@ async function handleMcp(msg) {
             ? params.protocolVersion
             : supportedVersions[0],
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'loop', version: '1.0.0' },
+          serverInfo: { name: 'loop', version: VERSION },
           instructions,
         },
       };
@@ -475,13 +324,17 @@ stdinRl.on('line', async (line) => {
 });
 
 // ── lifecycle ────────────────────────────────────────────────────
+// The daemon outlives this session; closing our link just lets it count down
+// to its idle exit once every session is gone.
 
 function shutdown() {
-  if (phone) send(phone.socket, { t: 'bye' });
-  failPending('BRIDGE_SHUTDOWN');
-  if (mdns) mdns.kill();
-  tcpServer.close();
+  closed = true;
+  if (link) link.destroy();
   process.exit(0);
 }
+stdinRl.on('close', shutdown); // Claude Code closed the session
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+
+// Bring the daemon up right away so the phone can reconnect before any tool call.
+ensureDaemon().catch((e) => log('daemon start failed:', e?.message ?? e));
