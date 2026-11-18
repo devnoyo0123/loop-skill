@@ -324,15 +324,30 @@ function bridgeStatusText() {
     );
   }
   const ip = lanIp();
-  if (ip) lines.push(`This Mac's address for the phone: ${ip} (port ${TCP_PORT}).`);
+  // The phone app has the port built in and its field takes an IP only — a
+  // port shown here gets typed in ("1.2.3.4:8766") and the connect fails.
+  if (ip) {
+    lines.push(
+      `This Mac's IP for the phone: ${ip} — give the user this IP only; ` +
+        'never mention a port (the app adds it itself).',
+    );
+  }
   if (phone) {
     lines.push(`Phone connected (device ${phone.deviceId}).`);
   } else {
     lines.push('Phone not connected.');
-    lines.push(
-      'Ask the user to open Loop → Settings → PC 연결 on the phone and connect ' +
-        `to this Mac (port ${TCP_PORT}).`,
-    );
+    if (state.devices.length > 0) {
+      // Paired before — the link ends on its own (1 h idle, user tap, Wi-Fi).
+      lines.push(
+        'Ask the user to reconnect the PC link: Loop → Settings → PC 연결 → 연결 ' +
+          '(already paired — no code needed). Retry the call once they say it is connected.',
+      );
+    } else {
+      lines.push(
+        'Ask the user to open Loop → Settings → PC 연결 on the phone; if it does ' +
+          'not find this Mac by itself, have them enter the IP above.',
+      );
+    }
   }
   lines.push(`Paired devices on this Mac: ${state.devices.length}.`);
   lines.push(`Claude sessions using this bridge: ${shims.size}. Bridge ${VERSION}.`);

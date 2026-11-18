@@ -44,7 +44,7 @@ bridge needs the plugin install above.
 ## Usage
 
 Open Loop → Settings → **PC 연결** on the phone and connect to your computer
-(auto-discovered, or enter its IP — port 8766). First time, Claude shows an
+(auto-discovered, or enter its IP address only — no port). First time, Claude shows an
 8-digit pairing code via the `pairing_code` tool; type it into the phone. Then:
 
 ```

@@ -86,8 +86,8 @@ without a plugin update. Use whatever tools are listed.
 | Symptom | Cause → Fix |
 |---|---|
 | No `mcp__loop__*` tools at all | Plugin not enabled or `node` (≥18) missing — check `/plugin` and `node -v` |
-| Search says "Phone not connected" | Phone not linked → phone app → PC 연결, keep app in foreground |
-| Phone can't find the Mac | Auto-discovery missed → enter the Mac IP manually: `ipconfig getifaddr en0`, port 8766 |
+| Search says "Phone not connected" | Link ended (1 hour without queries, user disconnected, or Wi-Fi drop) → ask the user to reconnect: Loop → 설정 → PC 연결 → 연결 (no code if already paired), then retry |
+| Phone can't find the Mac | Auto-discovery missed → have the user enter the Mac IP only (`ipconfig getifaddr en0`). Never give the user a port — the app adds it, and a typed `IP:port` fails to connect |
 | "Port 8766 is held by another program" | Usually an older Loop plugin (< 1.2) still running in another Claude Code session — update the plugin and restart that session; the bridge takes the port over by itself |
 | Bridge won't start | Check `~/.loop-bridge/daemon.log` |
 | "did not answer within 30s" | Phone app backgrounded or locked → bring Loop to the foreground and retry |

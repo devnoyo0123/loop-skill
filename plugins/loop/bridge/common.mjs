@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 /** Bridge version. A shim that is newer than the running daemon replaces it. */
-export const VERSION = '1.3.0';
+export const VERSION = '1.3.1';
 
 export const TCP_PORT = Number(process.env.LOOP_BRIDGE_PORT || 8766);
 
